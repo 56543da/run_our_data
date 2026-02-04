@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from timm.models.helpers import named_apply
+from timm.models import named_apply
 from functools import partial
 
 def gcd(a, b):

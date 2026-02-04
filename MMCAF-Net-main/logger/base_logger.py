@@ -64,10 +64,14 @@ class BaseLogger(object):
     def _plot_curves(self, curves_dict):
         """Plot all curves in a dict as RGB images to TensorBoard."""
         for name, curve in curves_dict.items():
+            if name.endswith('_Ablation_Table') and isinstance(curve, str):
+                self.summary_writer.add_text(name.replace('_', '/'), curve, global_step=self.global_step)
+                print(f"Uploaded {name} table to TensorBoard at step {self.global_step}")
+                continue
             # 特殊处理：如果已经是处理好的图像（如 SHAP_Summary），直接上传
-            if name.endswith('_SHAP_Summary') and isinstance(curve, np.ndarray) and curve.ndim == 3:
+            if (name.endswith('_SHAP_Summary') or name.endswith('_GradCAM_Overlay') or name.endswith('_Input_Samples')) and isinstance(curve, np.ndarray) and curve.ndim == 3:
                 # 转换 (H, W, C) 为 (C, H, W)
-                img_to_upload = curve.transpose(2, 0, 1)
+                img_to_upload = np.ascontiguousarray(curve.transpose(2, 0, 1))
                 self.summary_writer.add_image(name.replace('_', '/'), img_to_upload, global_step=self.global_step)
                 print(f"Directly uploaded {name} image to TensorBoard.")
                 continue
@@ -76,7 +80,7 @@ class BaseLogger(object):
             ax = plt.gca()
 
             plot_type = None
-            for suffix in ['SHAP_Summary', 'AttnMap', 'GradCAM', 'Confusion Matrix', 'ROC', 'PRC']:
+            for suffix in ['Ablation_Table', 'SHAP_Summary', 'GradCAM_Overlay', 'AttnMap', 'GradCAM', 'Confusion Matrix', 'ROC', 'PRC']:
                 if name.endswith('_' + suffix):
                     plot_type = suffix
                     break
@@ -149,15 +153,14 @@ class BaseLogger(object):
                 # curve is gcam numpy array
                 # 简单可视化：绘制热力图
                 gcam = curve
-                # 如果是 3D (D, H, W)，取中间切片
-                if len(gcam.shape) == 3:
-                    mid_slice = gcam.shape[0] // 2
-                    gcam = gcam[mid_slice]
-                
                 im = ax.imshow(gcam, cmap='jet')
                 ax.set_title('Grad-CAM Heatmap')
                 plt.colorbar(im, ax=ax)
                 ax.axis('off')
+            elif plot_type == 'GradCAM_Overlay':
+                ax.imshow(curve)
+                ax.axis('off')
+                ax.set_title('Grad-CAM Overlay')
             elif plot_type == 'AttnMap':
                 # curve is attn_map numpy array [N, M]
                 im = ax.imshow(curve, cmap='viridis')
@@ -181,6 +184,7 @@ class BaseLogger(object):
             w, h = fig.canvas.get_width_height()
             curve_img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
             curve_img = curve_img.reshape((h, w, 3)).transpose(2, 0, 1) # 转换为 (C, H, W)
+            curve_img = np.ascontiguousarray(curve_img)
 
             self.summary_writer.add_image(name.replace('_', '/'), curve_img, global_step=self.global_step)
             print(f"Uploaded {name} plot to TensorBoard at step {self.global_step}")

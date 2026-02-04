@@ -25,12 +25,16 @@ import matplotlib.pyplot as plt
 import io
 import gc
 
+plt.switch_backend('agg')
+
 class ModelEvaluator1(object):
     def __init__(self, 
                  dataset_name, 
                  data_loaders, 
                  agg_method = None, 
-                 epochs_per_eval = 1):
+                 epochs_per_eval = 1,
+                 shap_eval_freq = 5,
+                 ablation_eval_freq = 5):
 
 
         self.aggregator=OutputAggregator(agg_method, num_bins=10, num_epochs=5)
@@ -38,6 +42,8 @@ class ModelEvaluator1(object):
         self.data_loaders=data_loaders
         self.dataset_name=dataset_name
         self.epochs_per_eval=epochs_per_eval #w
+        self.shap_eval_freq = shap_eval_freq
+        self.ablation_eval_freq = ablation_eval_freq
         self.cls_loss_fn= util.optim_util.get_loss_fn(is_classification=True, dataset=dataset_name)
         self.max_eval=None 
 
@@ -90,15 +96,20 @@ class ModelEvaluator1(object):
         model.eval()
         for data_loader in self.data_loaders:
             # Determine if we should perform heavy analysis (SHAP, Grad-CAM, Ablation)
-            do_analysis = False
+            do_shap = False
+            do_ablation = False
+            
             if epoch is not None:
-                # 修改为每 1 Epoch 执行一次深度分析，方便用户立即看到结果
-                # 原本是 2
-                if epoch % 1 == 0 or (num_epochs is not None and epoch >= num_epochs):
-                    do_analysis = True
+                # 判断是否执行 SHAP/Grad-CAM
+                if self.shap_eval_freq > 0 and (epoch % self.shap_eval_freq == 0 or (num_epochs is not None and epoch >= num_epochs)):
+                    do_shap = True
+                
+                # 判断是否执行 Ablation
+                if self.ablation_eval_freq > 0 and (epoch % self.ablation_eval_freq == 0 or (num_epochs is not None and epoch >= num_epochs)):
+                    do_ablation = True
             
             phase_metrics, phase_curves, sum_every_loss = self._eval_phase(
-                model, data_loader, data_loader.phase, device, tab, epoch, do_analysis, target_layer
+                model, data_loader, data_loader.phase, device, tab, epoch, num_epochs, do_shap, do_ablation, target_layer
             )
             metrics.update(phase_metrics)
             curves.update(phase_curves)
@@ -114,7 +125,7 @@ class ModelEvaluator1(object):
         return metrics,curves, eval_loss
 
     ###
-    def _eval_phase(self, model, data_loader, phase, device, table, epoch, do_analysis=False, target_layer='image_encoder.bfpu2'):
+    def _eval_phase(self, model, data_loader, phase, device, table, epoch, num_epochs=None, do_shap=False, do_ablation=False, target_layer='image_encoder.bfpu2'):
         #w
         out = None
         phase_curves = {} # 初始化用于存储分析结果（如 Grad-CAM）的字典
@@ -122,8 +133,11 @@ class ModelEvaluator1(object):
 
         # 单模态屏蔽评估 (Ablation Study) - 只在 Val/Test 且满足 do_analysis 条件时进行
         ablation_metrics = {}
-        if phase in ['val', 'test'] and do_analysis:
+        if phase in ['val', 'test'] and do_ablation:
             print(f"Running Ablation Study for {phase} (Epoch {epoch})...")
+            
+            # 用于存储所有模式的所有指标，生成详细表格
+            ablation_results = {}
             
             for mode in ['img_only', 'tab_only', 'baseline']:
                 mode_metrics, mode_curves = self._run_ablation(model, data_loader, device, table, mode)
@@ -135,19 +149,57 @@ class ModelEvaluator1(object):
                     'baseline': 'Multimodal'
                 }[mode]
                 
-                # 记录核心指标 (仅保留 Loss 和 AUROC，精简 Scalars 显示)
-                target_metrics = ['loss', 'AUROC']
+                # 初始化结果字典
+                ablation_results[suffix] = {}
+                
+                # 记录核心指标 (Scalar显示部分保持精简)
+                target_scalar_metrics = ['loss', 'AUROC']
                 for k, v in mode_metrics.items():
                     metric_name = k.split('_')[-1]
-                    if metric_name in target_metrics:
+                    
+                    # 收集所有指标用于表格
+                    # 修正：Loss 首字母大写不一致导致表格显示 -1
+                    display_name = 'Loss' if metric_name == 'loss' else metric_name
+                    ablation_results[suffix][display_name] = float(v)
+
+                    # 过滤不需要的特定组合 (Scalar)
+                    if metric_name == 'loss' and mode in ['tab_only', 'baseline']:
+                         continue
+                    if metric_name == 'AUROC' and mode == 'img_only':
+                         continue
+                         
+                    if metric_name in target_scalar_metrics:
                         ablation_metrics[f'{phase}_Ablation_{suffix}/{metric_name}'] = v
                 
-                # 记录混淆矩阵曲线 (仅保留混淆矩阵)
+                # 记录混淆矩阵曲线
                 for k, v in mode_curves.items():
                     if 'Confusion Matrix' in k:
-                        # 命名格式必须符合 BaseLogger 的后缀识别逻辑 (以 _Confusion Matrix 结尾)
                         phase_curves[f'{phase}_Ablation_{suffix}_Confusion Matrix'] = v
-                    # 其他曲线 (PRC, ROC) 在此被忽略，不写入 phase_curves
+
+            # 生成详细对比表格
+            if len(ablation_results) > 0:
+                # 定义要显示的列
+                columns = ['Loss', 'AUROC', 'Accuracy', 'F1', 'Sensitivity', 'Specificity']
+                
+                # 构建 Markdown 表头
+                header = "| Mode | " + " | ".join(columns) + " |\n"
+                header += "|---| " + " | ".join(["---:"] * len(columns)) + " |\n"
+                
+                rows = []
+                for suffix in ["ImgOnly", "TabOnly", "Multimodal"]:
+                    if suffix in ablation_results:
+                        res = ablation_results[suffix]
+                        row_str = f"| **{suffix}** |"
+                        for col in columns:
+                            val = res.get(col, -1)
+                            # 根据指标类型格式化
+                            if col == 'Loss':
+                                row_str += f" {val:.4f} |"
+                            else:
+                                row_str += f" {val:.4f} |"
+                        rows.append(row_str)
+                
+                phase_curves[f"{phase}_Ablation_Table"] = header + "\n".join(rows)
         
         """Evaluate a model for a single phase.
 
@@ -184,8 +236,13 @@ class ModelEvaluator1(object):
                 ids = [item for item in targets_dict['study_num']]
 
                 # 动态识别特征列
-                metadata_cols = ['NewPatientID', 'OriginalIndex', 'label', 'parser', 'num_slice', 'first_appear', 'avg_bbox', 'last_appear']
-                feature_cols = [c for c in table.columns if c not in metadata_cols and not c.startswith('Unnamed')]
+                desired_feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
+                feature_cols = [c for c in desired_feature_cols if c in table.columns]
+                if len(feature_cols) != len(desired_feature_cols):
+                    for c in desired_feature_cols:
+                        if c not in table.columns:
+                            table[c] = 0.0
+                    feature_cols = desired_feature_cols
                 
                 tab=[]
                 for i in range(len(targets_dict['study_num'])):
@@ -193,7 +250,7 @@ class ModelEvaluator1(object):
                     if patient_row.empty:
                         data = np.zeros(len(feature_cols), dtype=np.float32)
                     else:
-                        data = patient_row[feature_cols].iloc[0].values.astype(np.float32)
+                        data = patient_row[feature_cols].iloc[0].fillna(0.0).values.astype(np.float32)
                     tab.append(torch.tensor(data, dtype=torch.float32))
                 tab=torch.stack(tab)
                 if tab.ndim == 3: # 处理可能的维度问题
@@ -203,6 +260,15 @@ class ModelEvaluator1(object):
                     #w process data
                     img = img.to(device)
                     tab = tab.to(device)
+
+                    # 安全检查：防止输入 NaN
+                    if torch.isnan(img).any():
+                        print(f"WARNING: Found NaN in input image (batch at {num_evaluated}). Replacing with 0.")
+                        img = torch.nan_to_num(img, nan=0.0)
+                    if torch.isnan(tab).any():
+                        print(f"WARNING: Found NaN in input tabular data (batch at {num_evaluated}). Replacing with 0.")
+                        tab = torch.nan_to_num(tab, nan=0.0)
+
                     # 修正：BCEWithLogitsLoss 要求 label 为 Float 类型
                     label = targets_dict['is_abnormal'].to(device).float()
 
@@ -225,9 +291,13 @@ class ModelEvaluator1(object):
                 #w
                 self._record_batch(cls_logits,targets_dict['series_idx'],loss,**records)
 
+                # 可视化输入样本 (检查 BBox 裁剪效果) - 每个 Validation Epoch 做一次
+                if phase == 'val' and num_evaluated == 0:
+                     self._visualize_inputs(img, phase, phase_curves)
+
                 # 可解释性分析 (仅在验证集每个epoch的第一个batch做一次)
                 # 优化：只在满足 do_analysis 条件的 Epoch 进行耗时的可视化分析 (Grad-CAM, AttnMap, SHAP)
-                if phase == 'val' and num_evaluated == 0 and do_analysis:
+                if phase == 'val' and num_evaluated == 0 and do_shap:
                     print(f"DEBUG: Starting heavy analysis (Grad-CAM, SHAP, etc.) for {phase} at Epoch {epoch}...")
                     # 1. Grad-CAM 可视化
                     try:
@@ -246,9 +316,54 @@ class ModelEvaluator1(object):
                                  probs, _ = self.grad_cam.forward(cam_img, cam_tab)
                                  self.grad_cam.backward(idx=0)
                                  gcam = self.grad_cam.get_cam(target_layer)
-                                 phase_curves[f'{phase}_GradCAM'] = gcam
+                                 gcam_t = torch.from_numpy(gcam).unsqueeze(0).unsqueeze(0).float()
+                                 gcam_t = F.interpolate(
+                                     gcam_t,
+                                     size=cam_img.shape[-3:],
+                                     mode="trilinear",
+                                     align_corners=False,
+                                 )
+                                 gcam_up = gcam_t.squeeze(0).squeeze(0).clamp(0, 1).cpu().numpy()
+                                 gcam_depth_scores = gcam_up.reshape(gcam_up.shape[0], -1).mean(axis=1)
+                                 gcam_slice_idx = int(np.argmax(gcam_depth_scores))
+                                 gcam_slice = gcam_up[gcam_slice_idx]
+                                 phase_curves[f'{phase}_GradCAM'] = gcam_slice
                                  
-                                 # 立即释放钩子并清理梯度
+                                 # --- 优化 CT 图像归一化显示 ---
+                                 ct_slice = cam_img[0, 0, gcam_slice_idx].detach().cpu().numpy().astype(np.float32)
+                                 # 移除可能的 NaN/Inf
+                                 ct_slice = np.nan_to_num(ct_slice, nan=0.0, posinf=0.0, neginf=0.0)
+                                 
+                                 # 使用 CLAHE 增强 CT 底图对比度
+                                 ct_min, ct_max = ct_slice.min(), ct_slice.max()
+                                 if ct_max - ct_min > 1e-6:
+                                     ct_norm = (ct_slice - ct_min) / (ct_max - ct_min)
+                                 else:
+                                     ct_norm = ct_slice
+                                 ct_u8 = (ct_norm * 255.0).astype(np.uint8)
+                                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                                 ct_enhanced = clahe.apply(ct_u8)
+                                 ct_rgb = cv2.cvtColor(ct_enhanced, cv2.COLOR_GRAY2RGB)
+ 
+                                 # --- 优化 Overlay 逻辑 (Screen Blending + Threshold) ---
+                                 heat_u8 = (np.clip(gcam_slice, 0.0, 1.0) * 255.0).astype(np.uint8)
+                                 heat_rgb = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET)
+                                 heat_rgb = cv2.cvtColor(heat_rgb, cv2.COLOR_BGR2RGB)
+                                 
+                                 threshold = 0.2
+                                 mask_val = np.maximum(0, gcam_slice - threshold) / (1.0 - threshold)
+                                 mask_val = cv2.GaussianBlur(mask_val, (3, 3), 0)
+                                 alpha = mask_val[..., None]
+                                 
+                                 ct_float = ct_rgb.astype(np.float32) / 255.0
+                                 heat_float = heat_rgb.astype(np.float32) / 255.0
+                                 blend_screen = 1.0 - (1.0 - ct_float) * (1.0 - heat_float)
+                                 alpha_limited = np.clip(alpha, 0, 0.7)
+                                 out_float = ct_float * (1.0 - alpha_limited) + blend_screen * alpha_limited
+                                 overlay = (np.clip(out_float, 0, 1) * 255.0).astype(np.uint8)
+                                 
+                                 phase_curves[f'{phase}_GradCAM_Overlay'] = overlay
+                                 
                                  self.grad_cam._release_hooks()
                                  model.zero_grad()
                                  print("DEBUG: Grad-CAM completed and hooks released.")
@@ -275,16 +390,36 @@ class ModelEvaluator1(object):
                     try:
                         print("DEBUG: Running SHAP (KernelExplainer) for tabular features...")
 
-                        # 动态获取特征名称
-                        metadata_cols = ['NewPatientID', 'OriginalIndex', 'label', 'parser', 'num_slice', 'first_appear', 'avg_bbox', 'last_appear']
-                        current_feature_names = [c for c in table.columns if c not in metadata_cols and not c.startswith('Unnamed')]
+                        desired_feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
+                        current_feature_names = [c for c in desired_feature_cols if c in table.columns]
+                        if len(current_feature_names) != len(desired_feature_cols):
+                            for c in desired_feature_cols:
+                                if c not in table.columns:
+                                    table[c] = 0.0
+                            current_feature_names = desired_feature_cols
                         
-                        # 控制 KernelExplainer 的计算量
-                        bg_n = min(8, tab.shape[0])
-                        ex_n = min(2, tab.shape[0])
+                        unique_table = table.drop_duplicates(subset=['NewPatientID'], keep='first')
+                        x_pool = unique_table[current_feature_names].to_numpy(dtype=np.float32, copy=True)
+                        x_pool = np.nan_to_num(x_pool, nan=0.0, posinf=0.0, neginf=0.0)
 
-                        x_background = tab[:bg_n].detach().cpu().numpy()
-                        x_explain = tab[:ex_n].detach().cpu().numpy()
+                        pool_n = int(x_pool.shape[0])
+                        if pool_n < 2 or len(current_feature_names) == 0:
+                            raise ValueError(f"Insufficient tabular samples/features for SHAP: pool_n={pool_n}, features={len(current_feature_names)}")
+
+                        is_final_epoch = (num_epochs is not None and epoch is not None and epoch >= num_epochs)
+
+                        bg_n = min(10, pool_n)
+                        ex_n = min(5, pool_n)
+
+                        if is_final_epoch:
+                            print("DEBUG: Final epoch detected. Running high-quality SHAP on full data...")
+                            bg_n = min(100, pool_n)
+                            ex_n = pool_n
+
+                        bg_idx = np.random.choice(pool_n, size=bg_n, replace=False)
+                        ex_idx = np.random.choice(pool_n, size=ex_n, replace=False)
+                        x_background = x_pool[bg_idx]
+                        x_explain = x_pool[ex_idx]
 
                         img_fixed = img[:1].detach().clone()
 
@@ -314,39 +449,35 @@ class ModelEvaluator1(object):
                             return np.concatenate(all_probs, axis=0)
 
                         explainer = shap.KernelExplainer(_predict_tab, x_background)
-                        shap_values = explainer.shap_values(x_explain, nsamples=50)
+                        nsamples = 200 if is_final_epoch else 50
+                        shap_values = explainer.shap_values(x_explain, nsamples=nsamples)
                         if isinstance(shap_values, list):
                             shap_values = shap_values[0]
 
-                        # 显式创建 Figure 并设置大小
-                        fig = plt.figure(figsize=(12, 8))
+                        shap_values = np.asarray(shap_values, dtype=np.float32)
+                        if shap_values.ndim == 1:
+                            shap_values = shap_values.reshape(1, -1)
+                        if shap_values.shape[-1] != len(current_feature_names):
+                            raise ValueError(f"SHAP shape mismatch: shap_values={shap_values.shape}, features={len(current_feature_names)}")
+
                         shap.summary_plot(
                             shap_values,
                             x_explain,
                             feature_names=current_feature_names,
                             show=False,
-                            plot_type="bar"
+                            plot_type="dot",
+                            max_display=len(current_feature_names)
                         )
-                        # 强制重绘
-                        plt.tight_layout()
-                        
-                        buf = io.BytesIO()
-                        fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-                        buf.seek(0)
-                        shap_img = np.frombuffer(buf.getvalue(), dtype=np.uint8)
-                        shap_img = cv2.imdecode(shap_img, cv2.IMREAD_COLOR)
-                        if shap_img is not None:
-                            # shap_img 是 (H, W, C)，需要保持 HWC 格式，不要转置
-                            # BaseLogger 会在 add_image 时自动处理 HWC -> CHW
-                            # 这里只需确保它是 RGB
-                            shap_img = cv2.cvtColor(shap_img, cv2.COLOR_BGR2RGB)
-                            phase_curves[f'{phase}_SHAP_Summary'] = shap_img
-                            print(f"DEBUG: SHAP summary plot completed with {len(current_feature_names)} features.")
-                        else:
-                            print("ERROR: SHAP image decode failed!")
+                        fig = plt.gcf()
+                        fig.set_size_inches(12, 8)
+                        fig.tight_layout()
+                        fig.canvas.draw()
+                        w, h = fig.canvas.get_width_height()
+                        shap_img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape((h, w, 3))
+                        phase_curves[f'{phase}_SHAP_Summary'] = shap_img
+                        print(f"DEBUG: SHAP summary plot completed with {len(current_feature_names)} features.")
 
-                        plt.close(fig) 
-                        buf.close()
+                        plt.close(fig)
                         del explainer
                     except Exception as e:
                         print(f"ERROR: SHAP plot failed: {e}")
@@ -374,12 +505,25 @@ class ModelEvaluator1(object):
         """快速运行单模态消融评估，返回完整指标和曲线"""
         records = {'keys': [], 'probs': []}
         
+        # 映射 mode 字符串到整数 flag
+        # mode: 0=multimodal, 1=img_only (mask tab), 2=tab_only (mask img)
+        mode_flag = 0
+        if mode == 'img_only':
+            mode_flag = 1
+        elif mode == 'tab_only':
+            mode_flag = 2
+            
         with torch.no_grad():
             for i, (img, targets_dict) in enumerate(data_loader):
                 # 临床特征处理逻辑
                 ids = [item for item in targets_dict['study_num']]
-                metadata_cols = ['NewPatientID', 'OriginalIndex', 'label', 'parser', 'num_slice', 'first_appear', 'avg_bbox', 'last_appear']
-                feature_cols = [c for c in table.columns if c not in metadata_cols and not c.startswith('Unnamed')]
+                desired_feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
+                feature_cols = [c for c in desired_feature_cols if c in table.columns]
+                if len(feature_cols) != len(desired_feature_cols):
+                    for c in desired_feature_cols:
+                        if c not in table.columns:
+                            table[c] = 0.0
+                    feature_cols = desired_feature_cols
 
                 tab=[]
                 for k in range(len(targets_dict['study_num'])):
@@ -387,7 +531,7 @@ class ModelEvaluator1(object):
                     if patient_row.empty: 
                         data = np.zeros(len(feature_cols), dtype=np.float32)
                     else: 
-                        data = patient_row[feature_cols].iloc[0].values.astype(np.float32)
+                        data = patient_row[feature_cols].iloc[0].fillna(0.0).values.astype(np.float32)
                     tab.append(torch.tensor(data, dtype=torch.float32))
                 tab=torch.stack(tab)
                 if tab.ndim == 3:
@@ -395,17 +539,27 @@ class ModelEvaluator1(object):
 
                 img = img.to(device)
                 tab = tab.to(device)
+                
+                # 安全检查：防止输入 NaN 导致模型输出 NaN
+                if torch.isnan(img).any():
+                    print(f"WARNING: Found NaN in input image (batch {i}). Replacing with 0.")
+                    img = torch.nan_to_num(img, nan=0.0)
+                
+                if torch.isnan(tab).any():
+                    print(f"WARNING: Found NaN in input tabular data (batch {i}). Replacing with 0.")
+                    tab = torch.nan_to_num(tab, nan=0.0)
+
                 series_indices = targets_dict['series_idx']
 
-                # 实施屏蔽
-                if mode == 'img_only':
-                    tab = torch.zeros_like(tab)
-                elif mode == 'tab_only':
-                    img = torch.zeros_like(img)
+                # 注意：不再修改输入 img/tab，而是在 forward 中通过 mode_flag 屏蔽特征
+                # 这能避免全0输入导致的 BatchNorm 偏移或 Encoder Bias 问题
 
                 # 使用自动混合精度 (AMP) 评估
                 with torch.cuda.amp.autocast():
-                    out = model.forward(img, tab)
+                    out = model.forward(img, tab, mode=mode_flag)
+                
+                if torch.isnan(out).any():
+                    print(f"CRITICAL WARNING: Model output contains NaN at batch {i} (Mode={mode})!")
                 
                 self._record_batch(out, series_indices, None, **records)
         
@@ -413,6 +567,50 @@ class ModelEvaluator1(object):
         metrics, curves = self._get_summary_dicts(data_loader, mode, device, **records)
         model.zero_grad()
         return metrics, curves
+
+    def _visualize_inputs(self, img, phase, curves):
+        """可视化输入 Batch 的中间切片，用于验证数据预处理（如 BBox 裁剪）效果"""
+        try:
+            # img shape: (B, C, D, H, W)
+            # 取前 4 个样本
+            num_samples = min(img.shape[0], 4)
+            samples = img[:num_samples].detach().cpu().numpy()
+            
+            grid_images = []
+            for i in range(num_samples):
+                # 取中间切片: samples[i, 0, D//2, :, :]
+                # 假设 Channel 0 是 CT 图像
+                d_idx = samples.shape[2] // 2
+                mid_slice = samples[i, 0, d_idx, :, :]
+                
+                # 归一化到 0-255
+                # 注意：输入图像可能已经被归一化过（例如 -1 到 1 或 0 到 1），也可能包含负值
+                # 这里使用 Min-Max 归一化到 0-255 用于显示
+                min_val, max_val = mid_slice.min(), mid_slice.max()
+                if max_val - min_val > 1e-6:
+                    norm_slice = (mid_slice - min_val) / (max_val - min_val)
+                else:
+                    norm_slice = np.zeros_like(mid_slice) # 避免全白/全黑
+                
+                img_u8 = (norm_slice * 255).astype(np.uint8)
+                # 转为 RGB
+                img_rgb = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2RGB)
+                
+                # 添加文字说明 (Sample Index)
+                # cv2.putText(img, text, org, fontFace, fontScale, color, thickness)
+                cv2.putText(img_rgb, f"S{i}", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                
+                grid_images.append(img_rgb)
+            
+            # 拼接成一行
+            if grid_images:
+                # 简单水平拼接
+                grid_combined = np.hstack(grid_images)
+                curves[f'{phase}_Input_Samples'] = grid_combined
+                print(f"DEBUG: Generated input samples visualization for {phase}.")
+                
+        except Exception as e:
+            print(f"ERROR: Failed to visualize inputs: {e}")
 
     @staticmethod
     def _record_batch(logits, targets, loss, probs=None, keys=None, loss_meter=None):
@@ -486,10 +684,12 @@ class ModelEvaluator1(object):
                 conf_matrix = sk_metrics.confusion_matrix(labels, preds, labels=[0, 1])
                 tn, fp, fn, tp = conf_matrix.ravel()
                 
-                sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+                # 避免除零错误
+                denominator_sens = tp + fn
+                denominator_spec = tn + fp
+
+                sensitivity = tp / denominator_sens if denominator_sens > 0 else 0.0
+                specificity = tn / denominator_spec if denominator_spec > 0 else 0.0
                 f1 = sk_metrics.f1_score(labels, preds)
 
                 metrics.update({
@@ -498,8 +698,6 @@ class ModelEvaluator1(object):
                     phase + '_' + 'Accuracy': accuracy,
                     phase + '_' + 'Sensitivity': sensitivity,
                     phase + '_' + 'Specificity': specificity,
-                    phase + '_' + 'PPV': precision,
-                    phase + '_' + 'NPV': npv,
                     phase + '_' + 'F1': f1
                 })
                 curves.update({

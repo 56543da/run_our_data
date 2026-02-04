@@ -51,16 +51,12 @@ class ModelEvaluator(object):
             csv_path = os.path.join(data_dir, 'G_first_last_nor.csv')
             tab = pd.read_csv(csv_path)
             # 补齐 KNN 插值逻辑
-            feature_cols = ['Sex', 'Age', 'Weight', 'T-Stage', 'N-Stage', 'M-Stage', 'Smoking']
+            feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
             imputer = KNNImputer(n_neighbors=5)
+            for c in feature_cols:
+                if c not in tab.columns:
+                    tab[c] = 0.0
             tab[feature_cols] = imputer.fit_transform(tab[feature_cols])
-            
-            cols_to_norm = ['Age', 'Weight', 'T-Stage', 'N-Stage', 'M-Stage']
-            for col in cols_to_norm:
-                if col in tab.columns:
-                    col_min, col_max = tab[col].min(), tab[col].max()
-                    if col_max > col_min:
-                        tab[col] = (tab[col] - col_min) / (col_max - col_min)
         
         metrics, curves={}, {}
 
@@ -129,15 +125,18 @@ class ModelEvaluator(object):
                 ids = [item for item in targets_dict['study_num']]
 
                 tab=[]
-                feature_cols = ['Sex', 'Age', 'Weight', 'T-Stage', 'N-Stage', 'M-Stage', 'Smoking']
+                feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
                 for i in range(len(targets_dict['study_num'])):
                     patient_row = table[table['NewPatientID'] == ids[i]]
                     if patient_row.empty:
-                        data = np.zeros(7, dtype=np.float32)
+                        data = np.zeros(len(feature_cols), dtype=np.float32)
                     else:
-                        data = patient_row[feature_cols].iloc[0].values.astype(np.float32)
+                        for c in feature_cols:
+                            if c not in table.columns:
+                                table[c] = 0.0
+                        data = patient_row[feature_cols].iloc[0].fillna(0.0).values.astype(np.float32)
                     tab.append(torch.tensor(data, dtype=torch.float32))
-                tab=torch.stack(tab).squeeze(1)
+                tab=torch.stack(tab)
 
                 with torch.no_grad():
 

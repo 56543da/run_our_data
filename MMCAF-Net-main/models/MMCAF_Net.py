@@ -69,16 +69,27 @@ class MMCAF_Net(nn.Module):
         #dropout
         self.dropout=nn.Dropout(p=0.2)
 
-    def forward(self, i, tab):
+    def forward(self, i, tab, mode=0):
+        # mode: 0=multimodal, 1=img_only (mask tab), 2=tab_only (mask img)
         batch_size=i.shape[0]
 
         #img_encoder
         f,img_pred=self.image_encoder(i)
+        
+        # Ablation: TabOnly -> Mask Image Feature
+        if mode == 2:
+            f = torch.zeros_like(f)
+            
         #raise ValueError("img_pred是{}".format(img_pred))
 
         #表格数据特征提取
         
         query_tab, _, _, _ = self.kan(tab)
+        
+        # Ablation: ImgOnly -> Mask Tabular Feature
+        if mode == 1:
+            query_tab = torch.zeros_like(query_tab)
+
         #query_tab=self.mlp(tab)
 
         #多尺度注意力融合

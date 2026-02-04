@@ -23,53 +23,26 @@ except Exception as e:
     print(f"Please ensure 'G_first_last_nor.csv' and 'metadata.csv' exist in {DATA_DIR}")
     exit(1)
 
-# Process metadata
-sex_map = {'M': 1, 'F': 0}
-t_map = {
-    'is': 0, '1': 1, '1a': 1, '1b': 2, '1c': 3, 
-    '2': 4, '2a': 4, '2b': 5, '3': 6, '4': 7
-}
-m_map = {
-    '0': 0, '1': 1, '1a': 1, '1b': 2, '1c': 3, 
-    '2': 4, '3': 5
-}
+desired_feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
 
 # Create a dictionary for fast lookup
 meta_dict = {}
 for _, row in meta_df.iterrows():
     pid = str(row['NewPatientID']).strip()
-    
-    sex = sex_map.get(row['Sex'], 0)
-    try: age = float(row['Age'])
-    except: age = 0.0
-    try: weight = float(row['weight (kg)'])
-    except: weight = 0.0
-    t_stage = t_map.get(str(row['T-Stage']).strip(), 0)
-    try: n_stage = int(row['N-Stage'])
-    except: n_stage = 0
-    
-    m_col = 'Ｍ-Stage' if 'Ｍ-Stage' in row else 'M-Stage'
-    m_val = str(row.get(m_col, '0')).strip()
-    m_stage = m_map.get(m_val, 0)
-    
-    try: smoking = int(row['Smoking History'])
-    except: smoking = 0
-    
-    meta_dict[pid] = {
-        'Sex': sex, 'Age': age, 'Weight': weight,
-        'T-Stage': t_stage, 'N-Stage': n_stage, 'M-Stage': m_stage,
-        'Smoking': smoking
-    }
+    clin_data = {}
+    for c in desired_feature_cols:
+        v = row.get(c, 0.0)
+        try:
+            clin_data[c] = float(v)
+        except Exception:
+            clin_data[c] = 0.0
+    meta_dict[pid] = clin_data
 
 # Update G dataframe
 new_rows = []
 for _, row in g_df.iterrows():
     pid = str(row['NewPatientID']).strip()
-    clin_data = meta_dict.get(pid, {
-        'Sex': 0, 'Age': 0, 'Weight': 0,
-        'T-Stage': 0, 'N-Stage': 0, 'M-Stage': 0,
-        'Smoking': 0
-    })
+    clin_data = meta_dict.get(pid, {c: 0.0 for c in desired_feature_cols})
     
     # Create new row dict
     new_row = row.to_dict()
@@ -79,8 +52,9 @@ for _, row in g_df.iterrows():
 df_out = pd.DataFrame(new_rows)
 
 # Reorder columns
-cols = ['NewPatientID', 'Sex', 'Age', 'Weight', 'T-Stage', 'N-Stage', 'M-Stage', 'Smoking', 
-        'label', 'parser', 'num_slice', 'first_appear', 'avg_bbox', 'last_appear']
+meta_cols = ['NewPatientID'] + desired_feature_cols
+tail_cols = ['label', 'parser', 'num_slice', 'first_appear', 'avg_bbox', 'last_appear']
+cols = [c for c in meta_cols if c in df_out.columns] + [c for c in tail_cols if c in df_out.columns]
 df_out = df_out[cols]
 
 # Save

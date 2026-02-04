@@ -52,9 +52,18 @@ def test(args,table):
             ids = [item for item in targets_dict['study_num']]
             tab=[]
             for i in range(len(targets_dict['study_num'])):
-                data = table[table['NewPatientID'] == ids[i]].iloc[0, 1:8].astype(np.float32)
+                desired_feature_cols = ['实性成分大小', '毛刺征', '支气管异常征', '胸膜凹陷征', 'CEA']
+                if len([c for c in desired_feature_cols if c in table.columns]) != len(desired_feature_cols):
+                    for c in desired_feature_cols:
+                        if c not in table.columns:
+                            table[c] = 0.0
+                patient_row = table[table['NewPatientID'] == ids[i]]
+                if patient_row.empty:
+                    data = np.zeros(len(desired_feature_cols), dtype=np.float32)
+                else:
+                    data = patient_row[desired_feature_cols].iloc[0].fillna(0.0).values.astype(np.float32)
                 tab.append(torch.tensor(data, dtype=torch.float32))
-            tab = torch.stack(tab).squeeze(1)
+            tab = torch.stack(tab)
 
             means.append(inputs.mean().item())
             with torch.no_grad():

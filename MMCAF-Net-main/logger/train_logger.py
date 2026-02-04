@@ -20,6 +20,9 @@ class TrainLogger(BaseLogger):
         self.num_epochs = args.num_epochs
         self.loss_meters = self._init_loss_meters()
         self.loss_meter = util.AverageMeter()
+        
+        # 新增：用于统计整个 epoch 的平均 loss
+        self.epoch_loss_meter = util.AverageMeter()
 
     def _init_loss_meters(self):
         loss_meters = {}
@@ -55,6 +58,10 @@ class TrainLogger(BaseLogger):
         """Log results from a training iteration."""
         cls_loss = None if cls_loss is None else cls_loss.item()
         self._update_loss_meters(inputs.size(0), cls_loss)
+        
+        # 更新 epoch loss 统计
+        if cls_loss is not None:
+            self.epoch_loss_meter.update(cls_loss, inputs.size(0))
 
         # Periodically write to the log and TensorBoard
         if self.iter % self.iters_per_print == 0:
@@ -82,6 +89,8 @@ class TrainLogger(BaseLogger):
         self.epoch_start_time = time()
         self.iter = 0
         self.write('[start of epoch {}]'.format(self.epoch))
+        # 重置 epoch loss 统计
+        self.epoch_loss_meter.reset()
 
     def end_epoch(self, metrics, curves):
         """Log info for end of an epoch.
@@ -92,6 +101,22 @@ class TrainLogger(BaseLogger):
         """
         self.write('[end of epoch {}, epoch time: {:.2g}]'.format(self.epoch, time() - self.epoch_start_time))
         self._log_scalars(metrics)
+        
+        # --- Loss Comparison Plot ---
+        # 获取 Train Epoch Loss
+        train_loss = self.epoch_loss_meter.avg
+        # 获取 Val Epoch Loss (从 metrics 中提取)
+        val_loss = metrics.get('val_loss', None)
+        
+        if val_loss is not None:
+            # 使用 add_scalars 将两条曲线画在同一张图上
+            # 这里的 tag 是 'Loss/Compare'，x 轴使用 self.epoch
+            self.summary_writer.add_scalars('Loss/Compare', {
+                'train': train_loss,
+                'val': val_loss
+            }, self.epoch)
+            print(f"Logged Loss/Compare to TensorBoard: train={train_loss:.4f}, val={val_loss:.4f}")
+        # ----------------------------
 
         self._plot_curves(curves)
 

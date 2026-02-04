@@ -22,6 +22,7 @@ class CTPEDataset3d(BaseCTDataset):
         self.pe_types = args.pe_types
         #w
         self.crop_shape = args.crop_shape
+        self.use_bbox_crop = getattr(args, 'use_bbox_crop', False)
         self.do_hflip = self.is_training_set and args.do_hflip
         self.do_vflip = self.is_training_set and args.do_vflip
         self.do_rotate = self.is_training_set and args.do_rotate
@@ -48,14 +49,42 @@ class CTPEDataset3d(BaseCTDataset):
             
             valid_ctpes = []
             filtered_count = 0
+            missing_ctpes = []
             for ctpe in all_ctpes:
                 if str(ctpe.study_num) in valid_keys:
                     valid_ctpes.append(ctpe)
                 else:
                     filtered_count += 1
+                    missing_ctpes.append(ctpe)
             
             if filtered_count > 0:
                 print(f"Filtered {filtered_count} samples that are missing in {self.h5_filename}. Remaining: {len(valid_ctpes)}")
+                missing_report_path = os.path.join(
+                    self.data_dir,
+                    f"missing_in_{os.path.splitext(self.h5_filename)[0]}_{self.phase}.txt"
+                )
+                try:
+                    with open(missing_report_path, "w", encoding="utf-8") as fh:
+                        fh.write(f"h5_path={h5_path}\n")
+                        fh.write(f"phase={self.phase}\n")
+                        fh.write(f"missing_count={len(missing_ctpes)}\n")
+                        fh.write("missing_items:\n")
+                        for ctpe in missing_ctpes:
+                            fh.write(
+                                f"- study_num={ctpe.study_num}\t"
+                                f"label={int(ctpe.is_positive)}\t"
+                                f"parser={ctpe.phase}\t"
+                                f"num_slice={ctpe.num_slice}\t"
+                                f"first_appear={ctpe.first_appear}\t"
+                                f"last_appear={ctpe.last_appear}\n"
+                            )
+                    print(f"Missing sample details written to: {missing_report_path}")
+                except Exception as e:
+                    print(f"Warning: failed to write missing sample report to {missing_report_path}: {e}")
+
+                print("Missing study_num list (first 50):")
+                for ctpe in missing_ctpes[:50]:
+                    print(f"  - {ctpe.study_num} (label={int(ctpe.is_positive)}, parser={ctpe.phase}, num_slice={ctpe.num_slice})")
             all_ctpes = valid_ctpes
         else:
             print(f"Warning: HDF5 file not found at {h5_path}")
@@ -73,7 +102,7 @@ class CTPEDataset3d(BaseCTDataset):
             self.window_to_series_idx += num_windows * [i]   
             self.series_to_window_idx.append(window_start) 
             window_start += num_windows 
-        print(len(self.window_to_series_idx))
+        print(f"{self.phase} windows: {len(self.window_to_series_idx)} (series={len(self.ctpe_list)}, num_slices={self.num_slices})")
         #sys.exit()
     #w
     def _include_ctpe(self, pe):
@@ -98,7 +127,7 @@ class CTPEDataset3d(BaseCTDataset):
             start_idx = min(max(start_idx, 0), len(ctpe) - self.num_slices)
         #w
         volume = self._load_volume(ctpe, start_idx)   
-        volume = self._transform(volume)     
+        volume = self._transform(volume, ctpe.bbox)     
         #w
         target = {'is_abnormal':ctpe.is_positive,
                   'study_num':ctpe.study_num,   
@@ -168,16 +197,73 @@ class CTPEDataset3d(BaseCTDataset):
             volume = volume[start_slice:start_slice + self.num_slices, :, :]
         return volume
     #w
-    def _transform(self, inputs):
+    def _transform(self, inputs, bbox=None):
         inputs = self._pad(inputs)
+        
+        # 记录原始尺寸和缩放比例
+        scale_h, scale_w = 1.0, 1.0
         if self.resize_shape is not None:
-            inputs = self._rescale(inputs, interpolation = cv2.INTER_AREA)  
+            orig_h, orig_w = inputs.shape[-2], inputs.shape[-1]
+            inputs = self._rescale(inputs, interpolation = cv2.INTER_AREA)
+            # 计算缩放因子 (new / old)
+            new_h, new_w = inputs.shape[-2], inputs.shape[-1]
+            if orig_h > 0 and orig_w > 0:
+                scale_h = new_h / orig_h
+                scale_w = new_w / orig_w
+
         if self.crop_shape is not None:
             row_margin = max(0, inputs.shape[-2] - self.crop_shape[-2])    
             col_margin = max(0, inputs.shape[-1] - self.crop_shape[-1])
-            #w
-            row = random.randint(0, row_margin) if self.is_training_set else row_margin // 2
-            col = random.randint(0, col_margin) if self.is_training_set else col_margin // 2
+            
+            # 默认逻辑
+            if self.is_training_set:
+                row = random.randint(0, row_margin)
+                col = random.randint(0, col_margin)
+            else:
+                row = row_margin // 2
+                col = col_margin // 2
+            
+            # BBox 逻辑: 仅在 use_bbox_crop 开启且 bbox 有效时覆盖默认逻辑
+            if self.use_bbox_crop and bbox is not None:
+                try:
+                    # 解析 bbox
+                    if isinstance(bbox, str):
+                        bbox = eval(bbox)
+                    
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                        # 假设 bbox 是 [x1, y1, x2, y2]
+                        b_x1, b_y1, b_x2, b_y2 = bbox
+                        
+                        # 缩放 bbox 到当前图像尺寸
+                        b_x1 *= scale_w
+                        b_x2 *= scale_w
+                        b_y1 *= scale_h
+                        b_y2 *= scale_h
+                        
+                        # 计算 bbox 中心点
+                        c_x = (b_x1 + b_x2) / 2
+                        c_y = (b_y1 + b_y2) / 2
+                        
+                        # 计算目标 crop 的左上角坐标 (row=y, col=x)
+                        # 我们希望 crop 框的中心对齐 bbox 中心
+                        target_row = int(c_y - self.crop_shape[-2] / 2)
+                        target_col = int(c_x - self.crop_shape[-1] / 2)
+                        
+                        # 限制在合法范围内 (row_margin 是允许的最大起始点)
+                        row = min(max(0, target_row), row_margin)
+                        col = min(max(0, target_col), col_margin)
+                        
+                        # 在训练集可以增加一点随机扰动，增强鲁棒性
+                        if self.is_training_set and self.do_jitter:
+                            jitter_range = 10 # 像素
+                            row += random.randint(-jitter_range, jitter_range)
+                            col += random.randint(-jitter_range, jitter_range)
+                            row = min(max(0, row), row_margin)
+                            col = min(max(0, col), col_margin)
+                except Exception as e:
+                    # 静默失败，回退到默认逻辑
+                    pass
+
             inputs = self._crop(inputs, col, row, col + self.crop_shape[-1], row + self.crop_shape[-2])
         if self.do_vflip and random.random() < 0.5:
             inputs = np.flip(inputs, axis = -2)

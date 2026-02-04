@@ -59,6 +59,8 @@ class BaseArgParser(object):
         self.parser.add_argument('--only_topmost_window',type=util.str_to_bool,default=False)
         self.parser.add_argument('--num_channels',type=int,default=3)
         self.parser.add_argument('--min_abnormal_slices',type=int,default=4)
+        # BBox crop option
+        self.parser.add_argument('--use_bbox_crop',type=util.str_to_bool,default=False)
 
     def parse_args(self):
         args =self.parser.parse_args()

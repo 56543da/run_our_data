@@ -11,17 +11,14 @@ import nibabel as nib
 import re
 
 # 自动识别路径: 基于当前脚本所在目录
-# 假设脚本位于 e:\rerun2\MMCAF-Net-main\hdf5_ours.py
-# 数据位于 e:\rerun2\data
-# 需要回退一级目录找到 data
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR) # e:\rerun2
 DEFAULT_DCM_ROOT = os.path.join(PROJECT_ROOT, 'data', 'Lung')
 DEFAULT_OUTPUT_H5 = os.path.join(PROJECT_ROOT, 'data', 'data.hdf5')
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Convert DICOM to HDF5 with multi-threading')
-    parser.add_argument('--dcm_root', type=str, default=DEFAULT_DCM_ROOT, help='Root directory of DICOM files')
+    parser = argparse.ArgumentParser(description='Convert DICOM to HDF5 with multi-threading (Recursive Search)')
+    parser.add_argument('--dcm_root', type=str, default=DEFAULT_DCM_ROOT, help='Root directory to search for NIfTI/DICOM files')
     parser.add_argument('--output_h5', type=str, default=DEFAULT_OUTPUT_H5, help='Output path for the HDF5 file')
     parser.add_argument('--threads', type=int, default=4, help='Number of threads to use')
     return parser.parse_args()
@@ -32,12 +29,15 @@ def read_nifti_data(folder_path):
     if not os.path.exists(nii_path):
         return None, None
 
-    # Extract ID from folder name (assumed PXXXX format)
+    # Extract ID from folder name (assumed PXXXX format or just folder name)
     folder_name = os.path.basename(folder_path)
+    # Try to match P number first
     id_match = re.search(r'(P\d+)', folder_name)
-    if not id_match:
-        return None, None
-    patient_id = id_match.group(1)
+    if id_match:
+        patient_id = id_match.group(1)
+    else:
+        # If no P number, use folder name as ID
+        patient_id = folder_name
 
     try:
         img = nib.load(nii_path)
@@ -77,7 +77,9 @@ def read_dicom_data(args_tuple):
     data_list = np.array(data_list)
     
     if data_list.shape[1] != 512:
-        return None, None
+        # Basic check, might skip if size varies
+        # return None, None
+        pass
 
     # Extract Patient ID
     path_parts = dirpath.split(os.sep)
@@ -88,7 +90,8 @@ def read_dicom_data(args_tuple):
             break
     
     if not patient_id:
-        return None, None
+        # Fallback to folder name if not structured
+        patient_id = os.path.basename(dirpath)
 
     return patient_id, data_list
 
@@ -105,22 +108,22 @@ def main():
 
     # 收集所有需要处理的目录
     tasks = []
-    mode = 'dicom'
+    mode = 'nifti' # Default preference
     
-    # Check if root contains NIfTI folders (0/1 structure)
-    if os.path.exists(os.path.join(dcm_root, '0')) or os.path.exists(os.path.join(dcm_root, '1')):
-        for label in ['0', '1']:
-            label_dir = os.path.join(dcm_root, label)
-            if not os.path.exists(label_dir): continue
-            for folder in os.listdir(label_dir):
-                full_path = os.path.join(label_dir, folder)
-                if os.path.exists(os.path.join(full_path, 'Lung.nii')):
-                    tasks.append(('nifti', full_path))
-                    mode = 'nifti'
+    # Recursive search for Lung.nii
+    print("Searching for 'Lung.nii' files recursively...")
+    nifti_found = False
     
-    if not tasks and mode == 'dicom':
+    for root, dirs, files in os.walk(dcm_root):
+        if 'Lung.nii' in files:
+            tasks.append(('nifti', root))
+            nifti_found = True
+            
+    if not nifti_found:
+        print("No 'Lung.nii' files found. Switching to DICOM search...")
+        mode = 'dicom'
         for dirpath, dirnames, filenames in os.walk(dcm_root):
-            if 'ALPHA' in dirpath:
+            if 'ALPHA' in dirpath: # Skip some known artifacts if any
                 continue
             if any(f.lower().endswith('.dcm') for f in filenames):
                 tasks.append(('dicom', (dirpath, filenames)))
@@ -167,6 +170,7 @@ def main():
                                 if data.shape[0] > existing_shape[0]:
                                     del h5f[patient_id]
                                     h5f.create_dataset(patient_id, data=data, compression='gzip')
+                                # Else keep existing larger one
                             else:
                                 h5f.create_dataset(patient_id, data=data, compression='gzip')
                     except Exception as e:

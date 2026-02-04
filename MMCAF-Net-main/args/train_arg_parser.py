@@ -43,6 +43,8 @@ class TrainArgParser(BaseArgParser):
         self.parser.add_argument('--max_ckpts',type=int,default=2)
         self.parser.add_argument('--lr_milestones',type=str,default='50,125,250')
         self.parser.add_argument('--lr_decay_gamma',type=float,default=0.1)
+        self.parser.add_argument('--shap_eval_freq',type=int,default=5, help='Frequency of SHAP/Grad-CAM analysis (epochs)')
+        self.parser.add_argument('--ablation_eval_freq',type=int,default=5, help='Frequency of Ablation study (epochs)')
         
 
         
