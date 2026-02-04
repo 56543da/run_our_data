@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "PowerShell: Run Multi Experiments",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${workspaceFolder}/run_multi_experiments.ps1",
+            "args": []
+        },
+        {
+            "name": "PowerShell: Launch Current File",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${file}",
+            "args": []
+        }
+    ]
+}

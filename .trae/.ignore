@@ -1,0 +1,21 @@
+{
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.git",
+    "**/.venv",
+    "**/venv",
+    "**/env",
+    "**/build",
+    "**/dist",
+    "**/logs",
+    "**/*.png",
+    "**/*.jpg",
+    "**/*.jpeg",
+    "**/*.bin",
+    "**/*.pt",
+    "**/*.pth",
+    "**/*.ckpt"
+  ],
+  "fileEnumerationTimeout": 30000
+}
