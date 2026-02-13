@@ -12,8 +12,8 @@ import concurrent.futures
 # 自动识别路径: 基于当前脚本所在目录
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-DEFAULT_TRAIN_DIR = os.path.join(PROJECT_ROOT, 'data', 'Lung', 'lung(train)')
-DEFAULT_VAL_DIR = os.path.join(PROJECT_ROOT, 'data', 'Lung', 'lung(val)')
+DEFAULT_TRAIN_DIR = os.path.join(PROJECT_ROOT, 'data', 'Lung')
+DEFAULT_VAL_DIR = os.path.join(PROJECT_ROOT, 'data', 'Lung')
 DEFAULT_METADATA_FILE = os.path.join(PROJECT_ROOT, 'data', '原始STAS_data.xlsx')
 DEFAULT_OUTPUT_CSV = os.path.join(PROJECT_ROOT, 'data', 'G_first_last_nor.csv')
 
@@ -40,8 +40,8 @@ COLUMN_MAPPING = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Preprocess data metadata (Explicit Train/Val Split)')
-    parser.add_argument('--train_dir', type=str, default=DEFAULT_TRAIN_DIR, help='Directory of Training NIfTI files')
-    parser.add_argument('--val_dir', type=str, default=DEFAULT_VAL_DIR, help='Directory of Validation NIfTI files')
+    parser.add_argument('--train_dir', type=str, default=DEFAULT_TRAIN_DIR, help="NIfTI root dir containing subfolders '0' (negative) and '1' (positive)")
+    parser.add_argument('--val_dir', type=str, default=DEFAULT_VAL_DIR, help="NIfTI root dir containing subfolders '0' (negative) and '1' (positive)")
     parser.add_argument('--meta_file', type=str, default=DEFAULT_METADATA_FILE, help='Path to clinical metadata Excel')
     parser.add_argument('--output_csv', type=str, default=DEFAULT_OUTPUT_CSV, help='Output path for the metadata CSV')
     parser.add_argument('--demo', action='store_true', help='Process partial dataset for demo')
@@ -85,7 +85,7 @@ def load_and_process_metadata_excel(meta_path, sheet_name=0):
              if not name_col: name_col = col
              
     if not name_col:
-        print("Warning: Could not find Name column in Excel.")
+        print(f"Warning: Could not find Name column in Excel. Available columns: {list(df.columns)}")
         return [], []
 
     # Create a reverse mapping for robust column selection
@@ -429,10 +429,15 @@ def main():
     print("Metadata Generation Complete!")
     print(f"Output saved to: {output_csv}")
     print(f"Total rows in CSV: {len(df_final)}")
-    print("\nDataset Split Statistics:")
-    print(df_final['parser'].value_counts())
-    print("\nLabel Distribution (Final):")
-    print(df_final.groupby(['parser', 'label']).size())
+    
+    if not df_final.empty and 'parser' in df_final.columns:
+        print("\nDataset Split Statistics:")
+        print(df_final['parser'].value_counts())
+        print("\nLabel Distribution (Final):")
+        print(df_final.groupby(['parser', 'label']).size())
+    else:
+        print("\nWarning: No data generated or 'parser' column missing.")
+        
     print("="*50 + "\n")
 
 if __name__ == '__main__':

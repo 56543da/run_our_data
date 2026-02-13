@@ -45,6 +45,47 @@ class TrainArgParser(BaseArgParser):
         self.parser.add_argument('--lr_decay_gamma',type=float,default=0.1)
         self.parser.add_argument('--shap_eval_freq',type=int,default=5, help='Frequency of SHAP/Grad-CAM analysis (epochs)')
         self.parser.add_argument('--ablation_eval_freq',type=int,default=5, help='Frequency of Ablation study (epochs)')
+        self.parser.add_argument('--use_amp',type=util.str_to_bool,default=True, help='Enable Automatic Mixed Precision (AMP)')
+        self.parser.add_argument('--external_test_path', type=str, default='', help='Path to external test excel file')
+        self.parser.add_argument('--external_eval_freq', type=int, default=5, help='Frequency of external validation (epochs)')
+        self.parser.add_argument(
+            '--train_mode',
+            type=str,
+            default='multimodal',
+            choices=('multimodal', 'img_only', 'tab_only'),
+            help='Training forward mode: multimodal (default), img_only (mask tab), tab_only (mask img)'
+        )
+        self.parser.add_argument(
+            '--single_modal_train_scope',
+            type=str,
+            default='encoder_head',
+            choices=('encoder', 'encoder_head'),
+            help='When train_mode is img_only/tab_only, train encoder (incl. fusion) or encoder+final classifier head'
+        )
+        self.parser.add_argument(
+            '--resume_optimizer',
+            type=util.str_to_bool,
+            default=None,
+            help='When resuming from ckpt, whether to resume optimizer/scheduler states. Default: True for multimodal, False otherwise.'
+        )
+        self.parser.add_argument(
+            '--reset_scheduler',
+            type=util.str_to_bool,
+            default=False,
+            help='If True, do not load scheduler state from ckpt and restart scheduler stepping from 0 (or scheduler_start_step).'
+        )
+        self.parser.add_argument(
+            '--scheduler_start_step',
+            type=int,
+            default=0,
+            help='Only used when reset_scheduler=True. Relative step value used for the first scheduler.step(). Useful to skip warmup by setting it to lr_warmup_steps.'
+        )
+        self.parser.add_argument(
+            '--override_lr',
+            type=float,
+            default=-1.0,
+            help='If > 0, override optimizer learning rate after resume (and sync scheduler base_lrs).'
+        )
         
 
         

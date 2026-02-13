@@ -100,7 +100,6 @@ class TrainLogger(BaseLogger):
             curves: Dictionary of curves. Items have format '{phase}_{curve}: value.
         """
         self.write('[end of epoch {}, epoch time: {:.2g}]'.format(self.epoch, time() - self.epoch_start_time))
-        self._log_scalars(metrics)
         
         # --- Loss Comparison Plot ---
         # 获取 Train Epoch Loss
@@ -118,6 +117,85 @@ class TrainLogger(BaseLogger):
             print(f"Logged Loss/Compare to TensorBoard: train={train_loss:.4f}, val={val_loss:.4f}")
         # ----------------------------
 
+        if not hasattr(self, 'last_ablation_auroc'):
+            self.last_ablation_auroc = {
+                'train': {'ImgOnly': None, 'TabOnly': None, 'Multimodal': None},
+                'val': {'ImgOnly': None, 'TabOnly': None, 'Multimodal': None},
+                'external': {'ImgOnly': None, 'TabOnly': None, 'Multimodal': None},
+            }
+
+        train_imgonly_auc = metrics.get('train_Ablation_ImgOnly/AUROC', None)
+        train_tabonly_auc = metrics.get('train_Ablation_TabOnly/AUROC', None)
+        train_multimodal_auc = metrics.get('train_Ablation_Multimodal/AUROC', None)
+
+        val_imgonly_auc = metrics.get('val_Ablation_ImgOnly/AUROC', None)
+        val_tabonly_auc = metrics.get('val_Ablation_TabOnly/AUROC', None)
+        val_multimodal_auc = metrics.get('val_Ablation_Multimodal/AUROC', None)
+
+        ext_tabonly_auc = metrics.get('External_external_test_AUROC', None)
+
+        if train_imgonly_auc is not None:
+            self.last_ablation_auroc['train']['ImgOnly'] = float(train_imgonly_auc)
+        if train_tabonly_auc is not None:
+            self.last_ablation_auroc['train']['TabOnly'] = float(train_tabonly_auc)
+        if train_multimodal_auc is not None:
+            self.last_ablation_auroc['train']['Multimodal'] = float(train_multimodal_auc)
+
+        if val_imgonly_auc is not None:
+            self.last_ablation_auroc['val']['ImgOnly'] = float(val_imgonly_auc)
+        if val_tabonly_auc is not None:
+            self.last_ablation_auroc['val']['TabOnly'] = float(val_tabonly_auc)
+        if val_multimodal_auc is not None:
+            self.last_ablation_auroc['val']['Multimodal'] = float(val_multimodal_auc)
+
+        if ext_tabonly_auc is not None:
+            self.last_ablation_auroc['external']['TabOnly'] = float(ext_tabonly_auc)
+
+        train_show = self.last_ablation_auroc['train']
+        val_show = self.last_ablation_auroc['val']
+        ext_show = self.last_ablation_auroc['external']
+
+        if any(v is not None for v in list(train_show.values()) + list(val_show.values()) + list(ext_show.values())):
+            def _fmt(v):
+                return 'n/a' if v is None else f'{float(v):.4f}'
+            text = (
+                "| Split | ImgOnly AUROC | TabOnly AUROC | Multimodal AUROC |\n"
+                "|---|---:|---:|---:|\n"
+                f"| Train | {_fmt(train_show.get('ImgOnly'))} | {_fmt(train_show.get('TabOnly'))} | {_fmt(train_show.get('Multimodal'))} |\n"
+                f"| Val (Internal) | {_fmt(val_show.get('ImgOnly'))} | {_fmt(val_show.get('TabOnly'))} | {_fmt(val_show.get('Multimodal'))} |\n"
+                f"| External | {_fmt(ext_show.get('ImgOnly'))} | {_fmt(ext_show.get('TabOnly'))} | {_fmt(ext_show.get('Multimodal'))} |\n"
+            )
+            self.summary_writer.add_text('AUROC/TabOnly_Compare', text, self.epoch)
+
+            scalars = {}
+            if train_show.get('ImgOnly') is not None:
+                scalars['Train_ImgOnly'] = train_show.get('ImgOnly')
+            if train_show.get('TabOnly') is not None:
+                scalars['Train_TabOnly'] = train_show.get('TabOnly')
+            if train_show.get('Multimodal') is not None:
+                scalars['Train_Multimodal'] = train_show.get('Multimodal')
+
+            if val_show.get('ImgOnly') is not None:
+                scalars['Val_ImgOnly'] = val_show.get('ImgOnly')
+            if val_show.get('TabOnly') is not None:
+                scalars['Val_TabOnly'] = val_show.get('TabOnly')
+            if val_show.get('Multimodal') is not None:
+                scalars['Val_Multimodal'] = val_show.get('Multimodal')
+
+            if ext_show.get('TabOnly') is not None:
+                scalars['External_TabOnly'] = ext_show.get('TabOnly')
+            if len(scalars) > 0:
+                self.summary_writer.add_scalars('AUROC/TabOnly_Compare', scalars, self.epoch)
+
+        def _keep_scalar(k):
+            if '_Ablation_' in k:
+                return False
+            if (k.endswith('NPV') or k.endswith('PPV') or ('/NPV' in k) or ('/PPV' in k)):
+                return False
+            return True
+
+        metrics_to_log = {k: v for k, v in metrics.items() if _keep_scalar(k)}
+        self._log_scalars(metrics_to_log)
         self._plot_curves(curves)
 
         self.epoch += 1

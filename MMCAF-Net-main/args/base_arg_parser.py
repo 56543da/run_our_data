@@ -103,12 +103,21 @@ class BaseArgParser(object):
             args.device ='cpu'
 
         #W 输出以确定是否是固定运行，默认是
-        if args.deterministic:
+        if args.cudnn_benchmark:
+            # 如果开启了 benchmark 以追求速度，强制关闭 deterministic
+            if args.deterministic:
+                print('Warning: --cudnn_benchmark=True, disabling deterministic mode for speed.')
+                args.deterministic = False
+                cudnn.deterministic = False
+            cudnn.benchmark = True
+            print('cuDNN Benchmark enabled (Speed mode).')
+        elif args.deterministic:
             torch.manual_seed(0)
             np.random.seed(0)
             random.seed(0)
             cudnn.deterministic=True
-            print('固定种子')
+            cudnn.benchmark = False # 显式关闭
+            print('固定种子 (Deterministic mode)')
 
         # Map dataset name to a class
         if args.dataset =='kinetics':

@@ -34,7 +34,8 @@ class ModelEvaluator1(object):
                  agg_method = None, 
                  epochs_per_eval = 1,
                  shap_eval_freq = 5,
-                 ablation_eval_freq = 5):
+                 ablation_eval_freq = 5,
+                 use_amp = True):
 
 
         self.aggregator=OutputAggregator(agg_method, num_bins=10, num_epochs=5)
@@ -46,10 +47,17 @@ class ModelEvaluator1(object):
         self.ablation_eval_freq = ablation_eval_freq
         self.cls_loss_fn= util.optim_util.get_loss_fn(is_classification=True, dataset=dataset_name)
         self.max_eval=None 
+        self.use_amp = bool(use_amp)
+        bf16_supported = False
+        try:
+            bf16_supported = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+        except Exception:
+            bf16_supported = False
+        self.amp_dtype = torch.bfloat16 if (self.use_amp and bf16_supported) else torch.float16
 
 
 
-    def evaluate(self, model, device, epoch=None, num_epochs=None, table=None):
+    def evaluate(self, model, device, epoch=None, num_epochs=None, table=None, train_mode='multimodal'):
 
         #w
         # tab = pd.read_csv('e:/rerun2/data/G_first_last_nor.csv')
@@ -109,7 +117,7 @@ class ModelEvaluator1(object):
                     do_ablation = True
             
             phase_metrics, phase_curves, sum_every_loss = self._eval_phase(
-                model, data_loader, data_loader.phase, device, tab, epoch, num_epochs, do_shap, do_ablation, target_layer
+                model, data_loader, data_loader.phase, device, tab, epoch, num_epochs, do_shap, do_ablation, target_layer, train_mode
             )
             metrics.update(phase_metrics)
             curves.update(phase_curves)
@@ -125,20 +133,18 @@ class ModelEvaluator1(object):
         return metrics,curves, eval_loss
 
     ###
-    def _eval_phase(self, model, data_loader, phase, device, table, epoch, num_epochs=None, do_shap=False, do_ablation=False, target_layer='image_encoder.bfpu2'):
+    def _eval_phase(self, model, data_loader, phase, device, table, epoch, num_epochs=None, do_shap=False, do_ablation=False, target_layer='image_encoder.bfpu2', train_mode='multimodal'):
         #w
         out = None
         phase_curves = {} # 初始化用于存储分析结果（如 Grad-CAM）的字典
 
 
-        # 单模态屏蔽评估 (Ablation Study) - 只在 Val/Test 且满足 do_analysis 条件时进行
+        # 单模态屏蔽评估 (Ablation Study) - 在 Train/Val/Test 且满足 do_analysis 条件时进行
         ablation_metrics = {}
-        if phase in ['val', 'test'] and do_ablation:
+        if phase in ['train', 'val', 'test'] and do_ablation:
             print(f"Running Ablation Study for {phase} (Epoch {epoch})...")
             
-            # 用于存储所有模式的所有指标，生成详细表格
             ablation_results = {}
-            
             for mode in ['img_only', 'tab_only', 'baseline']:
                 mode_metrics, mode_curves = self._run_ablation(model, data_loader, device, table, mode)
                 
@@ -148,26 +154,21 @@ class ModelEvaluator1(object):
                     'tab_only': 'TabOnly',
                     'baseline': 'Multimodal'
                 }[mode]
-                
-                # 初始化结果字典
+
                 ablation_results[suffix] = {}
-                
-                # 记录核心指标 (Scalar显示部分保持精简)
+
                 target_scalar_metrics = ['loss', 'AUROC']
                 for k, v in mode_metrics.items():
                     metric_name = k.split('_')[-1]
                     
-                    # 收集所有指标用于表格
-                    # 修正：Loss 首字母大写不一致导致表格显示 -1
                     display_name = 'Loss' if metric_name == 'loss' else metric_name
                     ablation_results[suffix][display_name] = float(v)
 
-                    # 过滤不需要的特定组合 (Scalar)
                     if metric_name == 'loss' and mode in ['tab_only', 'baseline']:
-                         continue
+                        continue
                     if metric_name == 'AUROC' and mode == 'img_only':
-                         continue
-                         
+                        continue
+
                     if metric_name in target_scalar_metrics:
                         ablation_metrics[f'{phase}_Ablation_{suffix}/{metric_name}'] = v
                 
@@ -176,12 +177,9 @@ class ModelEvaluator1(object):
                     if 'Confusion Matrix' in k:
                         phase_curves[f'{phase}_Ablation_{suffix}_Confusion Matrix'] = v
 
-            # 生成详细对比表格
             if len(ablation_results) > 0:
-                # 定义要显示的列
                 columns = ['Loss', 'AUROC', 'Accuracy', 'F1', 'Sensitivity', 'Specificity']
                 
-                # 构建 Markdown 表头
                 header = "| Mode | " + " | ".join(columns) + " |\n"
                 header += "|---| " + " | ".join(["---:"] * len(columns)) + " |\n"
                 
@@ -192,11 +190,7 @@ class ModelEvaluator1(object):
                         row_str = f"| **{suffix}** |"
                         for col in columns:
                             val = res.get(col, -1)
-                            # 根据指标类型格式化
-                            if col == 'Loss':
-                                row_str += f" {val:.4f} |"
-                            else:
-                                row_str += f" {val:.4f} |"
+                            row_str += f" {val:.4f} |"
                         rows.append(row_str)
                 
                 phase_curves[f"{phase}_Ablation_Table"] = header + "\n".join(rows)
@@ -272,9 +266,28 @@ class ModelEvaluator1(object):
                     # 修正：BCEWithLogitsLoss 要求 label 为 Float 类型
                     label = targets_dict['is_abnormal'].to(device).float()
 
-                    # 使用自动混合精度 (AMP) 评估，保持与训练一致
-                    with torch.cuda.amp.autocast():
-                        out = model.forward(img, tab)
+                    enabled_amp = bool(self.use_amp and torch.cuda.is_available())
+                    with torch.cuda.amp.autocast(enabled=enabled_amp, dtype=self.amp_dtype):
+                        # 如果是外部验证集 (TabOnly)，强制 mode=2
+                        # 我们通过 data_loader.phase 或 dataset_name 来判断
+                        # 但这里我们无法直接访问 data_loader，除非传进来
+                        # 幸运的是，我们可以在外部循环通过 hack model.forward 来解决
+                        # 或者在这里加个简单判断：
+                        # 如果 img 是全 0 (sum == 0)，则可能是伪造的，但这不严谨
+                        # 最好的方式是检查 data_loader.phase (如果我们在 _eval_phase 传入了 phase 参数)
+                        
+                        forward_mode = 0 # Default Multimodal
+                        
+                        # 如果训练模式是单模态，验证也应使用该模式作为默认模式
+                        if train_mode == 'img_only':
+                            forward_mode = 1
+                        elif train_mode == 'tab_only':
+                            forward_mode = 2
+                        
+                        if hasattr(data_loader, 'phase') and 'external' in str(data_loader.phase):
+                             forward_mode = 2 # TabOnly for external test (forced)
+                             
+                        out = model.forward(img, tab, mode=forward_mode)
                         label = label.unsqueeze(1)
                         cls_loss = self.cls_loss_fn(out, label).mean()
                         loss = cls_loss
@@ -292,12 +305,15 @@ class ModelEvaluator1(object):
                 self._record_batch(cls_logits,targets_dict['series_idx'],loss,**records)
 
                 # 可视化输入样本 (检查 BBox 裁剪效果) - 每个 Validation Epoch 做一次
-                if phase == 'val' and num_evaluated == 0:
+                # 仅在非外部验证集（TabOnly）时执行
+                is_external = 'external' in str(phase) or 'External' in str(phase)
+                if phase == 'val' and num_evaluated == 0 and not is_external:
                      self._visualize_inputs(img, phase, phase_curves)
 
                 # 可解释性分析 (仅在验证集每个epoch的第一个batch做一次)
                 # 优化：只在满足 do_analysis 条件的 Epoch 进行耗时的可视化分析 (Grad-CAM, AttnMap, SHAP)
-                if phase == 'val' and num_evaluated == 0 and do_shap:
+                # 同样，在 TabOnly 模式下跳过 Grad-CAM 和 AttnMap
+                if phase == 'val' and num_evaluated == 0 and do_shap and not is_external:
                     print(f"DEBUG: Starting heavy analysis (Grad-CAM, SHAP, etc.) for {phase} at Epoch {epoch}...")
                     # 1. Grad-CAM 可视化
                     try:
@@ -431,25 +447,20 @@ class ModelEvaluator1(object):
 
                             img_fixed_dev = img_fixed.to(device)
 
-                            # 分批推理
                             chunk = 2
-                            all_probs = []
+                            all_logits = []
                             with torch.inference_mode():
                                 for start in range(0, x_t.shape[0], chunk):
                                     end = min(start + chunk, x_t.shape[0])
                                     x_chunk = x_t[start:end]
                                     img_rep = img_fixed_dev.repeat(x_chunk.shape[0], 1, 1, 1, 1)
-                                    if torch.cuda.is_available():
-                                        with torch.cuda.amp.autocast(dtype=torch.float16):
-                                            logits = model.forward(img_rep, x_chunk)
-                                    else:
-                                        logits = model.forward(img_rep, x_chunk)
-                                    probs = torch.sigmoid(logits).squeeze(1).detach().cpu().numpy()
-                                    all_probs.append(probs)
-                            return np.concatenate(all_probs, axis=0)
+                                    logits = model.forward(img_rep, x_chunk, mode=2)
+                                    logits_np = logits.squeeze(1).detach().cpu().numpy().astype(np.float64, copy=False)
+                                    all_logits.append(logits_np)
+                            return np.concatenate(all_logits, axis=0)
 
-                        explainer = shap.KernelExplainer(_predict_tab, x_background)
-                        nsamples = 200 if is_final_epoch else 50
+                        explainer = shap.KernelExplainer(_predict_tab, x_background, link="identity")
+                        nsamples = 500 if is_final_epoch else 200
                         shap_values = explainer.shap_values(x_explain, nsamples=nsamples)
                         if isinstance(shap_values, list):
                             shap_values = shap_values[0]
@@ -459,6 +470,24 @@ class ModelEvaluator1(object):
                             shap_values = shap_values.reshape(1, -1)
                         if shap_values.shape[-1] != len(current_feature_names):
                             raise ValueError(f"SHAP shape mismatch: shap_values={shap_values.shape}, features={len(current_feature_names)}")
+
+                        import matplotlib.font_manager as fm
+                        font_list = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']
+                        selected_font = None
+                        for font in font_list:
+                            try:
+                                fm.findfont(fm.FontProperties(family=font), fallback_to_default=False)
+                                selected_font = font
+                                break
+                            except Exception:
+                                continue
+                        
+                        if selected_font:
+                            plt.rcParams['font.sans-serif'] = [selected_font]
+                            plt.rcParams['axes.unicode_minus'] = False
+                            print(f"DEBUG: Matplotlib font set to {selected_font}")
+                        else:
+                            print("WARNING: No Chinese font found. SHAP plot text may be corrupted.")
 
                         shap.summary_plot(
                             shap_values,
@@ -470,7 +499,7 @@ class ModelEvaluator1(object):
                         )
                         fig = plt.gcf()
                         fig.set_size_inches(12, 8)
-                        fig.tight_layout()
+                        fig.subplots_adjust(left=0.22, right=0.98, top=0.95, bottom=0.10)
                         fig.canvas.draw()
                         w, h = fig.canvas.get_width_height()
                         shap_img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape((h, w, 3))
@@ -554,8 +583,8 @@ class ModelEvaluator1(object):
                 # 注意：不再修改输入 img/tab，而是在 forward 中通过 mode_flag 屏蔽特征
                 # 这能避免全0输入导致的 BatchNorm 偏移或 Encoder Bias 问题
 
-                # 使用自动混合精度 (AMP) 评估
-                with torch.cuda.amp.autocast():
+                enabled_amp = bool(self.use_amp and torch.cuda.is_available())
+                with torch.cuda.amp.autocast(enabled=enabled_amp, dtype=self.amp_dtype):
                     out = model.forward(img, tab, mode=mode_flag)
                 
                 if torch.isnan(out).any():
@@ -688,31 +717,53 @@ class ModelEvaluator1(object):
                 denominator_sens = tp + fn
                 denominator_spec = tn + fp
 
-                sensitivity = tp / denominator_sens if denominator_sens > 0 else 0.0
-                specificity = tn / denominator_spec if denominator_spec > 0 else 0.0
-                f1 = sk_metrics.f1_score(labels, preds)
+                # 修正：当分母为 0 时（例如该类样本数为 0），返回 0.0 或 -1.0 可能会误导
+                # 按照惯例，如果没有正样本，Sensitivity (Recall) 无定义；如果没有负样本，Specificity 无定义。
+                # 但为了不中断训练流程，且避免 -1 这种奇怪的占位符，这里暂时返回 0.0，
+                # 并打印 debug 信息（仅在首次发生时或 verbose 模式下，这里简化处理）。
+                
+                sensitivity = float(tp) / float(denominator_sens) if denominator_sens > 0 else 0.0
+                specificity = float(tn) / float(denominator_spec) if denominator_spec > 0 else 0.0
+                
+                # 确保 f1_score 计算安全
+                # sk_metrics.f1_score 处理全 0 预测时可能会报 UndefinedMetricWarning 并返回 0.0，这是安全的
+                f1 = sk_metrics.f1_score(labels, preds, zero_division=0)
 
+                # 只有当存在正负样本且不全为同一类时，才计算 ROC/PRC
+                # 否则返回空，避免生成无意义的图表
+                has_valid_classes = len(np.unique(labels)) > 1
+                
                 metrics.update({
-                    phase + '_' + 'AUPRC': sk_metrics.average_precision_score(labels, probs),
-                    phase + '_' + 'AUROC': sk_metrics.roc_auc_score(labels, probs),
+                    phase + '_' + 'AUPRC': sk_metrics.average_precision_score(labels, probs) if has_valid_classes else 0.0,
+                    phase + '_' + 'AUROC': sk_metrics.roc_auc_score(labels, probs) if has_valid_classes else 0.0,
                     phase + '_' + 'Accuracy': accuracy,
                     phase + '_' + 'Sensitivity': sensitivity,
                     phase + '_' + 'Specificity': specificity,
                     phase + '_' + 'F1': f1
                 })
-                curves.update({
-                    phase + '_' + 'PRC': sk_metrics.precision_recall_curve(labels, probs),
-                    phase + '_' + 'ROC': sk_metrics.roc_curve(labels, probs),
-                    phase + '_' + 'Confusion Matrix': sk_metrics.confusion_matrix(labels, preds)
-                })
+                
+                if has_valid_classes:
+                    curves.update({
+                        phase + '_' + 'PRC': sk_metrics.precision_recall_curve(labels, probs, pos_label=1),
+                        phase + '_' + 'ROC': sk_metrics.roc_curve(labels, probs, pos_label=1),
+                        phase + '_' + 'Confusion Matrix': sk_metrics.confusion_matrix(labels, preds)
+                    })
+                else:
+                    # 如果类别无效，仅记录混淆矩阵 (即使只有一类也能画)
+                    curves.update({
+                        phase + '_' + 'Confusion Matrix': sk_metrics.confusion_matrix(labels, preds, labels=[0, 1])
+                    })
             except ValueError as e:
                 print(f"CRITICAL: {phase} evaluation failed due to NaN or invalid values: {e}")
-                # 设置极端指标，让用户在 TensorBoard 中能看到明显的“崩溃”信号
+                # 记录异常但尽量保持数值类型，避免 TensorBoard 报错
+                # 只有在完全无法计算时才给出一个极大的 Loss 作为信号
                 metrics.update({
                     phase + '_' + 'loss': 99.0,
                     phase + '_' + 'AUROC': 0.0,
                     phase + '_' + 'Accuracy': 0.0,
-                    phase + '_' + 'F1': 0.0
+                    phase + '_' + 'F1': 0.0,
+                    phase + '_' + 'Sensitivity': 0.0,
+                    phase + '_' + 'Specificity': 0.0
                 })
 
 

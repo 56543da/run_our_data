@@ -74,7 +74,11 @@ class MMCAF_Net(nn.Module):
         batch_size=i.shape[0]
 
         #img_encoder
-        f,img_pred=self.image_encoder(i)
+        if torch.is_autocast_enabled():
+            with torch.cuda.amp.autocast(enabled=False):
+                f, img_pred = self.image_encoder(i.float())
+        else:
+            f, img_pred = self.image_encoder(i)
         
         # Ablation: TabOnly -> Mask Image Feature
         if mode == 2:
@@ -83,8 +87,11 @@ class MMCAF_Net(nn.Module):
         #raise ValueError("img_pred是{}".format(img_pred))
 
         #表格数据特征提取
-        
-        query_tab, _, _, _ = self.kan(tab)
+        if torch.is_autocast_enabled():
+            with torch.cuda.amp.autocast(enabled=False):
+                query_tab, _, _, _ = self.kan(tab.float())
+        else:
+            query_tab, _, _, _ = self.kan(tab)
         
         # Ablation: ImgOnly -> Mask Tabular Feature
         if mode == 1:

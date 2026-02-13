@@ -63,21 +63,41 @@ try {
 
     # Define Experiment List
     $experiments = @(
-       # @{ name = "Exp1_adam_B32"; lr = "5e-5"; opt = "adam"; batch = "32"; epochs = "100"; eval_freq = "5"; resume = $true; bbox = $false }
-       @{ name = "Exp1_adam_B32_bbox"; lr = "1e-2"; opt = "adam"; batch = "32"; epochs = "50"; eval_freq = "1"; resume = $false; bbox = $true }
-
-        @{ name = "Exp2_sgd_B32_bbox"; lr = "1e-2"; opt = "sgd"; batch = "32"; epochs = "50"; eval_freq = "5"; resume = $false; bbox = $true }
-
-        @{ name = "Exp3_sgd_B32_resume"; lr = "1e-2"; opt = "sgd"; batch = "32"; epochs = "50"; eval_freq = "5"; resume = $true; bbox = $false }
+        # 示例：图像单模态训练，设定独立 LR。注意：resume_optim=$false 才能使新 LR 生效
+        # 推荐 LR：1e-4 (收敛稍快) 或 5e-5 (更稳健)
+        @{ name = "Exp1_adam_B32"; lr = "1e-4"; opt = "adam"; batch = "32"; epochs = "150"; eval_freq = "5"; resume = $true; train_mode = "img_only"; resume_optim = $false }
         
-        @{ name = "Exp4_adam_B32"; lr = "1e-2"; opt = "adam"; batch = "32"; epochs = "50"; eval_freq = "5"; resume = $false; bbox = $false }
+        # 示例：表格单模态训练
+        # @{ name = "Exp2_TabOnly"; lr = "1e-3"; opt = "adam"; batch = "32"; epochs = "150"; eval_freq = "5"; resume = $true; bbox = $false; amp = $False; train_mode = "tab_only"; resume_optim = $false }
     )
 
     foreach ($exp in $experiments) {
+        if (-not $exp.ContainsKey('train_mode')) { $exp.train_mode = "multimodal" }
+        if (-not $exp.ContainsKey('bbox')) { $exp.bbox = $false }
+        if (-not $exp.ContainsKey('amp')) { $exp.amp = $false }
+        $resumeOptim = $true
+        if ($exp.ContainsKey('resume_optim')) {
+            $resumeOptim = [bool]$exp.resume_optim
+        } else {
+            $resumeOptim = ($exp.train_mode -eq "multimodal")
+        }
+        
+        # 自动逻辑：如果不恢复优化器状态，通常意味着开启新的训练阶段，
+        # 此时必须重置调度器步数，否则继承的 global_step 会导致 scheduler 计算出极小的 lr
+        $resetScheduler = (-not $resumeOptim)
+        if ($exp.ContainsKey('reset_sched')) { $resetScheduler = [bool]$exp.reset_sched }
+        
+        $schedulerStartStep = 0
+        if ($exp.ContainsKey('sched_start')) { $schedulerStartStep = [int]$exp.sched_start }
+        $overrideLr = -1.0
+        if ($exp.ContainsKey('override_lr')) { $overrideLr = [double]$exp.override_lr }
+        # 自动构建外部测试集路径 (相对于 ../data)
+        $extTestPath = Join-Path "../data" "外部测试集.xlsx"
+        
         Write-Host "`n" + ("="*60) -ForegroundColor Cyan
         Write-Host "Starting Experiment: $($exp.name)" -ForegroundColor Cyan
-        Write-Host "Config: Optimizer=$($exp.opt), LR=$($exp.lr), BatchSize=$($exp.batch), Epochs=$($exp.epochs)" -ForegroundColor Cyan
-        Write-Host "Eval Config: Analysis Freq=$($exp.eval_freq)" -ForegroundColor Cyan
+        Write-Host "Config: Optimizer=$($exp.opt), LR=$($exp.lr), BatchSize=$($exp.batch), Epochs=$($exp.epochs), AMP=$($exp.amp)" -ForegroundColor Cyan
+        Write-Host "Eval Config: Analysis Freq=$($exp.eval_freq), Ext Test=$extTestPath" -ForegroundColor Cyan
         Write-Host ("="*60) -ForegroundColor Cyan
         
         # 自动断点续训逻辑
@@ -184,18 +204,26 @@ try {
             "--num_workers=8"
             "--optimizer=$($exp.opt)"
             "--pe_types=['central','segmental']"#无效，别慌
-            "--resize_shape=$res0zeShape"
+            "--resize_shape=$resizeShape"
             "--sgd_dampening=0.9"
             "--sgd_momentum=0.9"
             "--use_pretrained=False"
             "--use_bbox_crop=$($exp.bbox)"
+            "--use_amp=$($exp.amp)"
+            "--external_test_path=$extTestPath"
+            "--external_eval_freq=$($exp.eval_freq)"
+            "--train_mode=$($exp.train_mode)"
+            "--resume_optimizer=$resumeOptim"
+            "--reset_scheduler=$resetScheduler"
+            "--scheduler_start_step=$schedulerStartStep"
+            "--override_lr=$overrideLr"
         )
 
         # 执行训练
         if ($ckptArg) {
-            & $PYTHON_EXE train1.py @trainArgs $ckptArg 2>&1 | Tee-Object -FilePath $logFile -Append
+            & $PYTHON_EXE train1.py @trainArgs $ckptArg
         } else {
-            & $PYTHON_EXE train1.py @trainArgs 2>&1 | Tee-Object -FilePath $logFile -Append
+            & $PYTHON_EXE train1.py @trainArgs
         }
 
         Write-Host "Experiment $($exp.name) finished.`n" -ForegroundColor Green

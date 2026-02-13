@@ -99,6 +99,9 @@ class BaseLogger(object):
 
             ax.set_title(plot_type)
             if plot_type == 'PRC':
+                if not (isinstance(curve, tuple) and len(curve) >= 2 and len(curve[0]) > 0 and len(curve[1]) > 0):
+                    plt.close(fig)
+                    continue
                 precision, recall, _ = curve
                 ax.step(recall, precision, color='b', alpha=0.2, where='post')
                 ax.fill_between(recall, precision, step='post', alpha=0.2, color='b')
@@ -107,6 +110,9 @@ class BaseLogger(object):
                 ax.set_xlim([0.0, 1.0])
                 ax.set_ylim([0.0, 1.05])
             elif plot_type == 'ROC':
+                if not (isinstance(curve, tuple) and len(curve) >= 2 and len(curve[0]) > 0 and len(curve[1]) > 0):
+                    plt.close(fig)
+                    continue
                 false_positive_rate, true_positive_rate, thresholds = curve
                 # 计算 AUC
                 from sklearn.metrics import auc
@@ -196,7 +202,11 @@ class BaseLogger(object):
         with open(self.log_path, 'a') as log_file:
             log_file.write(message + '\n')
         if print_to_stdout:
-            print(message)
+            try:
+                from tqdm import tqdm
+                tqdm.write(message)
+            except Exception:
+                print(message)
 
     def start_iter(self):
         """Log info for start of an iteration."""

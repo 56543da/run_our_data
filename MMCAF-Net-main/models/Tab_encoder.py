@@ -26,7 +26,11 @@ class Tab_encoder(nn.Module):
 
     def forward(self,tab):
         #表格数据特征提取
-        query_tab, _, _, _ = self.kan(tab)
+        if torch.is_autocast_enabled():
+            with torch.cuda.amp.autocast(enabled=False):
+                query_tab, _, _, _ = self.kan(tab.float())
+        else:
+            query_tab, _, _, _ = self.kan(tab)
 
         #分类结果
         tab_pred=self.tab_cls(query_tab)
